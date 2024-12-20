@@ -1,29 +1,38 @@
 import pytest
-import os
+from pathlib import Path
 import tempfile
 from capstone import *
 from analyzer import PEAnalyzer
 from reporter import PEReporter
 
 
-def get_test_files():
-    """Получаем пути к тестовым PE файлам"""
-    test_dir = os.path.join(os.path.dirname(__file__), '..', 'test_files')
-    test_files = [
-        os.path.join(test_dir, 'calc.exe'),
-        os.path.join(test_dir, 'notepad.exe')
+@pytest.fixture(scope="session")
+def test_files():
+    """Фикстура для получения путей к тестовым PE файлам"""
+    test_dir = Path(__file__).parent.parent / 'test_files'
+    files = [
+        test_dir / 'calc.exe',
+        test_dir / 'notepad.exe'
     ]
-    return [f for f in test_files if os.path.exists(f)]
+    existing_files = [f for f in files if f.exists()]
+    if not existing_files:
+        pytest.skip("Тестовые PE файлы не найдены")
+    return existing_files
 
 
-@pytest.fixture(params=get_test_files())
-def pe_analyzer(request):
+@pytest.fixture
+def test_file(test_files, request):
+    """Фикстура для получения одного тестового файла"""
+    return test_files[request.param]
+
+
+@pytest.fixture
+def pe_analyzer(test_file):
     """
     Фикстура для создания объекта PEAnalyzer и проведения анализа.
-    Аналогично тому, как раньше создавали PEFile.
+    Использует фикстуру test_file для получения пути к файлу.
     """
-    test_file = request.param
-    analyzer = PEAnalyzer(test_file)
+    analyzer = PEAnalyzer(str(test_file))
     analyzer.analyze()
     return analyzer
 
@@ -34,9 +43,10 @@ def temp_output_file():
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
         temp_path = f.name
     yield temp_path
-    os.unlink(temp_path)
+    Path(temp_path).unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize('test_file', [0, 1], indirect=True)
 def test_section_headers(pe_analyzer):
     """Тест заголовков секций"""
     assert len(pe_analyzer.sections) > 0
@@ -50,6 +60,7 @@ def test_section_headers(pe_analyzer):
         assert section.raw_offset >= 0
 
 
+@pytest.mark.parametrize('test_file', [0, 1], indirect=True)
 def test_machine_code_disassembly(pe_analyzer):
     """Тест дизассемблирования машинного кода с помощью Capstone"""
     code_section = next((s for s in pe_analyzer.sections if s.name.lower() == '.text'), None)
@@ -76,6 +87,7 @@ def test_machine_code_disassembly(pe_analyzer):
         assert actual_bytes == code[:len(actual_bytes)]
 
 
+@pytest.mark.parametrize('test_file', [0, 1], indirect=True)
 def test_imports(pe_analyzer):
     """Тест таблицы импортов"""
     assert len(pe_analyzer.imports) > 0
@@ -92,11 +104,11 @@ def test_imports(pe_analyzer):
             assert len(func) > 0
 
 
-def test_debug_output(capsys):
+def test_debug_output(test_files, capsys):
     """Тест отладочного вывода через PEReporter"""
-    test_file = get_test_files()[0]
+    test_file = test_files[0]
 
-    analyzer = PEAnalyzer(test_file)
+    analyzer = PEAnalyzer(str(test_file))
     analyzer.analyze()
 
     reporter_no_debug = PEReporter(analyzer, debug=False)
@@ -110,11 +122,11 @@ def test_debug_output(capsys):
     assert captured.out == "DEBUG: Test message (with debug)\n"
 
 
-def test_file_output(temp_output_file):
+def test_file_output(test_files, temp_output_file):
     """Тест вывода в файл (reporter.output_file)"""
-    test_file = get_test_files()[0]
+    test_file = test_files[0]
 
-    analyzer = PEAnalyzer(test_file)
+    analyzer = PEAnalyzer(str(test_file))
     analyzer.analyze()
 
     reporter = PEReporter(analyzer, debug=True, output_file=temp_output_file)
@@ -132,12 +144,10 @@ def test_file_output(temp_output_file):
     assert "Таблица импортов:" in content
 
 
-def test_multiple_file_outputs(temp_output_file):
+def test_multiple_file_outputs(test_files, temp_output_file):
     """Тест множественного вывода в один и тот же файл"""
-    test_files = get_test_files()
-
     for test_file in test_files:
-        analyzer = PEAnalyzer(test_file)
+        analyzer = PEAnalyzer(str(test_file))
         analyzer.analyze()
 
         reporter = PEReporter(analyzer, debug=True, output_file=temp_output_file)
@@ -149,7 +159,7 @@ def test_multiple_file_outputs(temp_output_file):
 
     for test_file in test_files:
         assert f"Analyzing {test_file}" in content
-        assert os.path.basename(test_file) in content
+        assert test_file.name in content
 
 
 if __name__ == '__main__':
