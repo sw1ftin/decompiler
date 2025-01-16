@@ -10,6 +10,11 @@ class PEConstants:
     PE32_DATA_DIR_OFFSET: int = 96
     PE32PLUS_DATA_DIR_OFFSET: int = 112
     IMPORT_TABLE_RVA_OFFSET: int = 8
+    DOS_SIGNATURE_OFFSET: int = 0x3C
+    IMPORT_DIRECTORY_ENTRY_SIZE: int = 20
+    HINT_SIZE: int = 2
+    DOS_SIGNATURE: bytes = b'MZ'
+    PE_SIGNATURE: bytes = b'PE\x00\x00'
 
     NULL_CHAR_BYTE: bytes = b'\x00'
     PE32PLUS_FORMAT: int = 0x20B
@@ -19,6 +24,7 @@ class PEConstants:
     ORDINAL_FLAG_64: int = 0x8000000000000000
     MASK_32: int = 0x7FFFFFFF
     MASK_64: int = 0x7FFFFFFFFFFFFFFF
+    ORDINAL_MASK: int = 0xFFFF
 
 
 @dataclass
@@ -32,11 +38,40 @@ class SectionData:
     machine_code: dict | None = field(default=None)
 
 
+@dataclass
+class ImportDirectoryEntry:
+    """Структура для хранения записи в таблице импортов."""
+    import_lookup_table_rva: int
+    timestamp: int
+    forwarder_chain: int
+    name_rva: int
+    thunk_rva: int
+
+    @classmethod
+    def from_file(cls, file_obj) -> 'ImportDirectoryEntry':
+        """Создает объект ImportDirectoryEntry из файла."""
+        try:
+            values = struct.unpack('<IIIII', file_obj.read(PEConstants.IMPORT_DIRECTORY_ENTRY_SIZE))
+            return cls(*values)
+        except struct.error as e:
+            raise ValueError(f"Ошибка чтения Import Directory Entry: {e}")
+
+    def is_empty(self) -> bool:
+        """Проверяет, является ли запись пустой (конец таблицы)."""
+        return (self.import_lookup_table_rva == 0 and 
+                self.name_rva == 0 and 
+                self.thunk_rva == 0)
+
+
 class PEAnalyzer:
     def __init__(self, filepath: str):
         """Анализатор PE-файла. Считывает DOS-заголовок, PE-заголовок, секции и таблицу импортов."""
         self._filepath: str = filepath
+        self._sections: list[SectionData] = []
+        self._imports: dict[str, list[str]] = {}
+        self._consts = PEConstants()
 
+        # Приватные поля заголовков
         self._machine: int | None = None
         self._num_sections: int | None = None
         self._timestamp: int | None = None
@@ -54,14 +89,19 @@ class PEAnalyzer:
         self._base_of_data: int | None = None
         self._image_base: int | None = None
 
-        self.sections: list[SectionData] = []        # Список секций
-        self.imports: dict[str, list[str]] = {}      # Словарь {dll_name: [func1, func2, ...]}
-
-        self._consts = PEConstants()
-
     @property
     def filepath(self) -> str:
         return self._filepath
+
+    @property
+    def sections(self) -> list[SectionData]:
+        """Возвращает список секций."""
+        return self._sections
+
+    @property
+    def imports(self) -> dict[str, list[str]]:
+        """Возвращает словарь импортов."""
+        return self._imports
 
     @property
     def machine(self) -> int | None:
@@ -93,60 +133,63 @@ class PEAnalyzer:
 
     def _read_dos_header(self) -> None:
         """Чтение DOS-заголовка (MZ) и определение смещения PE-заголовка."""
-        with open(self._filepath, 'rb') as f:
-            dos_signature = f.read(2)
-            if dos_signature != b'MZ':
-                raise ValueError("Неверная DOS сигнатура (MZ)")
+        try:
+            with open(self._filepath, 'rb') as f:
+                dos_signature = f.read(2)
+                if dos_signature != self._consts.DOS_SIGNATURE:
+                    raise ValueError("Неверная DOS сигнатура (MZ)")
 
-            # e_lfanew (смещение PE) лежит по оффсету 0x3C
-            f.seek(0x3C)
-            self._pe_offset = struct.unpack('<I', f.read(4))[0]
+                f.seek(self._consts.DOS_SIGNATURE_OFFSET)
+                self._pe_offset = struct.unpack('<I', f.read(4))[0]
+        except (IOError, struct.error) as e:
+            raise ValueError(f"Ошибка чтения DOS заголовка: {e}")
 
     def _read_pe_header(self) -> None:
-        """Чтение COFF и Optional Header. Определение смещения (section_table_offset) к таблице секций."""
-        with open(self._filepath, 'rb') as f:
-            f.seek(self._pe_offset or 0)
-            pe_signature = f.read(4)
-            if pe_signature != b'PE\x00\x00':
-                raise ValueError("Неверная PE сигнатура (PE\\0\\0)")
+        """Чтение COFF и Optional Header. Определение смещения к таблице секций."""
+        try:
+            with open(self._filepath, 'rb') as f:
+                f.seek(self._pe_offset or 0)
+                pe_signature = f.read(4)
+                if pe_signature != self._consts.PE_SIGNATURE:
+                    raise ValueError("Неверная PE сигнатура")
 
-            # COFF Header
-            self._machine = struct.unpack('<H', f.read(2))[0]
-            self._num_sections = struct.unpack('<H', f.read(2))[0]
-            self._timestamp = struct.unpack('<I', f.read(4))[0]
+                self._read_coff_header(f)
+                self._read_optional_header(f)
+                self._section_table_offset = f.tell()
+        except (IOError, struct.error) as e:
+            raise ValueError(f"Ошибка чтения PE заголовка: {e}")
 
-            # Пропускаем PointerToSymbolTable(4) и NumberOfSymbols(4)
-            f.seek(8, 1)
+    def _read_coff_header(self, file_obj) -> None:
+        """Чтение COFF заголовка."""
+        self._machine = struct.unpack('<H', file_obj.read(2))[0]
+        self._num_sections = struct.unpack('<H', file_obj.read(2))[0]
+        self._timestamp = struct.unpack('<I', file_obj.read(4))[0]
+        file_obj.seek(8, 1)  # Пропускаем PointerToSymbolTable и NumberOfSymbols
+        self._optional_header_size = struct.unpack('<H', file_obj.read(2))[0]
+        self._characteristics = struct.unpack('<H', file_obj.read(2))[0]
+        self._optional_header_offset = file_obj.tell()
 
-            self._optional_header_size = struct.unpack('<H', f.read(2))[0]
-            self._characteristics = struct.unpack('<H', f.read(2))[0]
-            self._optional_header_offset = f.tell()
+    def _read_optional_header(self, file_obj) -> None:
+        """Чтение Optional Header."""
+        self._pe_format = struct.unpack('<H', file_obj.read(2))[0]
+        file_obj.seek(2, 1)  # Пропускаем LinkerVersion
 
-            self._pe_format = struct.unpack('<H', f.read(2))[0]
+        # Читаем базовые поля
+        (self._size_of_code, self._size_of_initialized_data,
+         self._size_of_uninitialized_data, self._entry_point,
+         self._base_of_code) = struct.unpack('<IIIII', file_obj.read(20))
 
-            # Пропускаем LinkerVersion (2 байта)
-            f.seek(2, 1)
+        if self._pe_format == self._consts.PE32_FORMAT:
+            self._base_of_data = struct.unpack('<I', file_obj.read(4))[0]
+            self._image_base = struct.unpack('<I', file_obj.read(4))[0]
+        else:
+            self._image_base = struct.unpack('<Q', file_obj.read(8))[0]
 
-            # Читаем поля Sizes & EntryPoint
-            self._size_of_code = struct.unpack('<I', f.read(4))[0]
-            self._size_of_initialized_data = struct.unpack('<I', f.read(4))[0]
-            self._size_of_uninitialized_data = struct.unpack('<I', f.read(4))[0]
-            self._entry_point = struct.unpack('<I', f.read(4))[0]
-            self._base_of_code = struct.unpack('<I', f.read(4))[0]
-
-            if self._pe_format == self._consts.PE32_FORMAT:  # PE32
-                self._base_of_data = struct.unpack('<I', f.read(4))[0]
-                self._image_base = struct.unpack('<I', f.read(4))[0]
-            else:  # PE32+ (0x20B)
-                self._image_base = struct.unpack('<Q', f.read(8))[0]
-
-            # Пропускаем оставшуюся часть Optional Header
-            read_so_far = f.tell() - (self._optional_header_offset or 0)
-            remaining_bytes = (self._optional_header_size or 0) - read_so_far
-            if remaining_bytes > 0:
-                f.seek(remaining_bytes, 1)
-
-            self._section_table_offset = f.tell()
+        # Пропускаем оставшуюся часть Optional Header
+        read_so_far = file_obj.tell() - self._optional_header_offset
+        remaining_bytes = self._optional_header_size - read_so_far
+        if remaining_bytes > 0:
+            file_obj.seek(remaining_bytes, 1)
 
     def _read_sections(self) -> None:
         """Чтение таблицы секций (Section Table)."""
@@ -172,12 +215,12 @@ class PEAnalyzer:
                     raw_size=raw_size,
                     raw_offset=raw_offset,
                 )
-                self.sections.append(section)
+                self._sections.append(section)
 
     def _read_machine_code(self) -> None:
         """Чтение первых 32 байт машинного кода каждой секции (если raw_size > 0)."""
         with open(self._filepath, 'rb') as f:
-            for section in self.sections:
+            for section in self._sections:
                 if section.raw_size > 0:
                     f.seek(section.raw_offset)
                     code_size = min(32, section.raw_size)
@@ -250,7 +293,7 @@ class PEAnalyzer:
                 current_offset += dll_entry_size
                 continue
 
-            self.imports[dll_name] = []
+            self._imports[dll_name] = []
 
             lookup_rva = import_lookup_table_rva if import_lookup_table_rva != 0 else thunk_rva
             lookup_offset = self._rva_to_offset(lookup_rva)
@@ -263,34 +306,42 @@ class PEAnalyzer:
 
     def _parse_import_functions(self, file_obj, dll_name: str, lookup_offset: int) -> None:
         """Читает список функций (или ординалов), связанных с конкретной Import Lookup/Address Table."""
-        file_obj.seek(lookup_offset)
+        try:
+            file_obj.seek(lookup_offset)
+            ordinal_flag, mask = self._get_ordinal_and_mask_for_pe()
 
-        ordinal_flag, mask = self._get_ordinal_and_mask_for_pe()
+            while True:
+                thunk_data = self._read_thunk_data(file_obj)
+                if thunk_data == 0:
+                    break
 
-        while True:
-            try:
-                if self._pe_format == self._consts.PE32PLUS_FORMAT:  # PE32+
-                    thunk_data = struct.unpack('<Q', file_obj.read(8))[0]
-                else:  # PE32
-                    thunk_data = struct.unpack('<I', file_obj.read(4))[0]
-            except struct.error:
-                break
+                if thunk_data & ordinal_flag:
+                    self._add_ordinal_import(dll_name, thunk_data)
+                else:
+                    self._add_name_import(file_obj, dll_name, thunk_data, mask)
+        except (IOError, struct.error) as e:
+            raise ValueError(f"Ошибка чтения функций импорта: {e}")
 
-            if thunk_data == 0:
-                break
+    def _read_thunk_data(self, file_obj) -> int:
+        """Читает ThunkData в зависимости от формата PE."""
+        if self._pe_format == self._consts.PE32PLUS_FORMAT:
+            return struct.unpack('<Q', file_obj.read(8))[0]
+        return struct.unpack('<I', file_obj.read(4))[0]
 
-            if thunk_data & ordinal_flag:
-                # Импорт по ординалу
-                ordinal = thunk_data & 0xFFFF
-                self.imports[dll_name].append(f"#{ordinal}")
-            else:
-                hint_name_rva = thunk_data & mask
-                name_offset = self._rva_to_offset(hint_name_rva)
-                if name_offset is not None:
-                    file_obj.seek(name_offset + 2)  # Пропускаем Hint (2 байта)
-                    func_name = self._read_string(file_obj)
-                    if func_name:
-                        self.imports[dll_name].append(func_name)
+    def _add_ordinal_import(self, dll_name: str, thunk_data: int) -> None:
+        """Добавляет импорт по ординалу."""
+        ordinal = thunk_data & self._consts.ORDINAL_MASK
+        self._imports[dll_name].append(f"#{ordinal}")
+
+    def _add_name_import(self, file_obj, dll_name: str, thunk_data: int, mask: int) -> None:
+        """Добавляет импорт по имени."""
+        hint_name_rva = thunk_data & mask
+        name_offset = self._rva_to_offset(hint_name_rva)
+        if name_offset is not None:
+            file_obj.seek(name_offset + self._consts.HINT_SIZE)
+            func_name = self._read_string(file_obj)
+            if func_name:
+                self._imports[dll_name].append(func_name)
 
     def _get_ordinal_and_mask_for_pe(self) -> tuple[int, int]:
         """Возвращает (ordinal_flag, mask), специфичные для PE32 или PE32+."""
@@ -301,7 +352,7 @@ class PEAnalyzer:
 
     def _rva_to_offset(self, rva: int) -> int | None:
         """Конвертация RVA в файловое смещение на основе таблицы секций."""
-        for section in self.sections:
+        for section in self._sections:
             start_rva = section.virtual_address
             end_rva = start_rva + section.virtual_size
             if start_rva <= rva < end_rva:
