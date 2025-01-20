@@ -47,20 +47,24 @@ class ImportDirectoryEntry:
     name_rva: int
     thunk_rva: int
 
-    @classmethod
-    def from_file(cls, file_obj) -> 'ImportDirectoryEntry':
-        """Создает объект ImportDirectoryEntry из файла."""
-        try:
-            values = struct.unpack('<IIIII', file_obj.read(PEConstants.IMPORT_DIRECTORY_ENTRY_SIZE))
-            return cls(*values)
-        except struct.error as e:
-            raise ValueError(f"Ошибка чтения Import Directory Entry: {e}")
-
     def is_empty(self) -> bool:
         """Проверяет, является ли запись пустой (конец таблицы)."""
         return (self.import_lookup_table_rva == 0 and 
                 self.name_rva == 0 and 
                 self.thunk_rva == 0)
+
+
+class ImportDirectoryEntryFactory:
+    """Фабрика для создания объектов ImportDirectoryEntry."""
+    
+    @staticmethod
+    def from_file(file_obj) -> ImportDirectoryEntry:
+        """Создает объект ImportDirectoryEntry из файла."""
+        try:
+            values = struct.unpack('<IIIII', file_obj.read(PEConstants.IMPORT_DIRECTORY_ENTRY_SIZE))
+            return ImportDirectoryEntry(*values)
+        except struct.error as e:
+            raise ValueError(f"Ошибка чтения Import Directory Entry: {e}")
 
 
 class PEAnalyzer:
